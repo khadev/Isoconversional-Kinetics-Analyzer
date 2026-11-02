@@ -1,0 +1,88 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "isoconversional-kinetics"
+version = "1.9.0"
+description = "Desktop GUI + library for isoconversional kinetic analysis of thermal decomposition data (Friedman, FWO, KAS, Starink, Vyazovkin)."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [
+    { name = "Isoconversional Kinetics Toolkit Contributors" }
+]
+keywords = [
+    "kinetics",
+    "isoconversional",
+    "activation-energy",
+    "thermal-analysis",
+    "TGA",
+    "DSC",
+    "Friedman",
+    "Flynn-Wall-Ozawa",
+    "Kissinger-Akahira-Sunose",
+    "Starink",
+    "Vyazovkin",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Environment :: X11 Applications",
+    "Environment :: Win32 (MS Windows)",
+    "Environment :: MacOS X",
+]
+
+# NOTE: version ranges here are intentionally permissive for PyPI
+# distribution. For an exact, fully-reproducible environment (e.g. for
+# PyInstaller builds), use requirements.txt instead, which pins exact
+# versions.
+dependencies = [
+    "customtkinter>=5.2.0,<6.0",
+    "Pillow>=10.0,<11.0",
+    "matplotlib>=3.8,<4.0",
+    "pandas>=2.0,<3.0",
+    "numpy>=1.24,<3.0",
+    "darkdetect>=0.7,<1.0",
+    "openpyxl>=3.1,<4.0",
+    "xlsxwriter>=3.0,<4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4,<9.0",
+    "pytest-cov>=4.1,<6.0",
+    "build>=1.0",
+    "twine>=5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/isoconversional-kinetics"
+Repository = "https://github.com/your-org/isoconversional-kinetics"
+Issues = "https://github.com/your-org/isoconversional-kinetics/issues"
+
+[project.scripts]
+isokinetics-gui = "isokinetics.main:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.coverage.run]
+source = ["src/isokinetics"]
