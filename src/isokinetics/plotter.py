@@ -28,11 +28,12 @@ import matplotlib
 
 matplotlib.use("Agg")  # safe default; the GUI switches to TkAgg explicitly.
 import matplotlib.pyplot as plt  # noqa: E402  (import after backend selection)
-from matplotlib.colors import to_hex  # noqa: E402
+from matplotlib.colors import to_hex, to_rgba  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 from matplotlib.ticker import FormatStrFormatter  # noqa: E402
 
 from .formatting import UNIT_EA, fmt_ea  # noqa: E402
+from .interval import MIN_POINTS, AlphaInterval, count_in_interval, mean_ea_in_interval  # noqa: E402
 
 #: Colour palettes for the two application themes.  The GUI imports the
 #: same table so widgets and plots always agree.
@@ -277,6 +278,12 @@ def apply_figure_theme(fig: Figure, theme: Optional[str] = None) -> Figure:
         for text in ax.texts:
             if text.get_gid() == "placeholder":
                 text.set_color(pal["muted"])
+            elif text.get_gid() == "interval_label":
+                text.set_color(pal["accent"])
+        for patch in ax.patches:
+            if patch.get_gid() == "alpha_interval":
+                patch.set_facecolor(to_rgba(pal["accent"], 0.14))
+                patch.set_edgecolor(to_rgba(pal["accent"], 0.85))
 
         legend = ax.get_legend()
         if legend is not None:
@@ -385,10 +392,20 @@ def update_plot(
     results: Dict[str, Dict[float, float]],
     averages: Optional[Dict[str, float]] = None,
     confidence_intervals: Optional[Dict[str, Dict[float, "tuple[float, float, float]"]]] = None,
+    interval: Optional[AlphaInterval] = None,
+    interval_means: Optional[Dict[str, float]] = None,
 ) -> Figure:
     """
     Clear and redraw the given figure with one Ea(alpha) curve per
     method.
+
+    When ``interval`` is given (the "stabilization phase" the user dragged
+    on the plot) the selected range is shaded with ``axvspan`` and every
+    legend entry shows the mean Ea **inside that range** --
+    ``Friedman (mean Ea [0.2-0.8] = 98.28 kJ/mol)`` -- instead of the
+    full-range mean.  The curves themselves, and the ``averages`` passed in,
+    are never altered: with ``interval=None`` the output is exactly the
+    full-range plot.
 
     Parameters
     ----------
@@ -406,6 +423,12 @@ def update_plot(
         returned by :func:`isokinetics.kinetics.confidence_interval`.
         When present for a given method, a shaded 95%/99% confidence
         band is drawn behind its line.
+    interval : AlphaInterval, optional
+        The selected alpha range (see :mod:`isokinetics.interval`).
+    interval_means : dict, optional
+        Precomputed ``method -> mean Ea inside interval`` (NaN = too few
+        points).  Computed here with
+        :func:`isokinetics.interval.mean_ea_in_interval` when omitted.
 
     Returns
     -------
@@ -440,7 +463,18 @@ def update_plot(
             finite = [e for e in clean_eas]
             avg = sum(finite) / len(finite) if finite else float("nan")
 
-        label = f"{method_name} (mean E\u2090 = {fmt_ea(avg, unit=True)})"
+        if interval is None:
+            label = f"{method_name} (mean E\u2090 = {fmt_ea(avg, unit=True)})"
+        else:
+            sub = (interval_means or {}).get(method_name)
+            if sub is None:
+                sub = mean_ea_in_interval(alpha_to_ea, interval)
+            if sub == sub:  # finite
+                label = f"{method_name} (mean E\u2090 [{interval.label}] = {fmt_ea(sub, unit=True)})"
+            else:
+                n = count_in_interval(alpha_to_ea, interval)
+                label = (f"{method_name} (mean E\u2090 [{interval.label}] = N/A, "
+                         f"{n} of {MIN_POINTS} points needed)")
         color = _method_color(method_name)
         marker = METHOD_MARKERS.get(method_name, "o")
 
@@ -473,6 +507,8 @@ def update_plot(
         any_plotted = True
 
     if any_plotted:
+        if interval is not None:
+            _draw_interval_span(ax, interval)
         ax.legend(loc="best", fontsize=9, framealpha=0.9)
     else:
         _placeholder(ax, "No results to display yet.\nLoad data and click 'Run Analysis'.")
@@ -480,6 +516,22 @@ def update_plot(
     fig.tight_layout()
     apply_figure_theme(fig)
     return fig
+
+
+def _draw_interval_span(ax, interval: AlphaInterval) -> None:
+    """Shade the selected alpha range (``axvspan``) and label it at the top.
+    Only a patch and a text are added -- never a Line2D -- so the plot still
+    holds exactly one line per method."""
+    accent = THEMES[_active_theme]["accent"]
+    ax.axvspan(
+        interval.lo, interval.hi, facecolor=to_rgba(accent, 0.14), edgecolor=to_rgba(accent, 0.85),
+        linewidth=1.0, zorder=0, gid="alpha_interval",
+    )
+    ax.text(
+        0.5 * (interval.lo + interval.hi), 0.985, f"\u03b1 = {interval.label}",
+        transform=ax.get_xaxis_transform(), ha="center", va="top", fontsize=8,
+        color=accent, gid="interval_label",
+    )
 
 
 def build_kth_model_figure() -> Figure:
@@ -554,7 +606,7 @@ def update_kth_model_plot(fig: Figure, kth_full_result: Optional[Dict[str, objec
 
     if not kth_full_result:
         for ax in (ax_y, ax_z):
-            _placeholder(ax, "Run KTH in\n'Full triplet' mode\nto see this plot.", fontsize=10)
+            _placeholder(ax, "Run KTH in 'Full triplet'\nmode, or use the\nbutton, to see this plot.", fontsize=10)
         fig.tight_layout()
         apply_figure_theme(fig)
         return fig

@@ -272,11 +272,19 @@ class EaSource:
     label: str
     ea_kj: Optional[float]  # None for manual entry
     note: str = ""
+    #: Stable identity that does not change when an interval suffix is added to
+    #: the label ("Friedman mean" for "Friedman mean (\u03b1 0.20\u20130.80)"); empty = label.
+    key: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.key:
+            self.key = self.label
 
 
 def available_ea_sources(
     averages: Optional[Dict[str, float]] = None,
     cr_result: Optional[Dict[str, object]] = None,
+    interval_label: Optional[str] = None,
 ) -> List[EaSource]:
     """
     Build the list of Ea sources, best first:
@@ -289,6 +297,13 @@ def available_ea_sources(
 
     When no model is recommended the first entry is therefore a model-free
     mean, and the note says why.
+
+    If ``interval_label`` (e.g. ``"0.20\u20130.80"``) is given, ``averages`` are
+    understood to be the means over that selected alpha interval: each
+    method-mean label gets the suffix ``" (\u03b1 0.20\u20130.80)"`` and its note says
+    so.  The Coats-Redfern entries are unaffected (model fitting uses the
+    whole conversion range).  Methods whose mean is NaN (too few points in
+    the interval) are left out.
     """
     sources: List[EaSource] = []
     cr_results = (cr_result or {}).get("results") or {}
@@ -303,10 +318,17 @@ def available_ea_sources(
 
     for name, value in (averages or {}).items():
         if value is not None and math.isfinite(value) and value > 0:
+            if interval_label:
+                label = f"{name} mean (\u03b1 {interval_label})"
+                note = (f"Mean of Ea(\u03b1) over the selected stabilization interval "
+                        f"\u03b1 {interval_label} (model-free).")
+            else:
+                label = f"{name} mean"
+                note = "Mean of Ea(\u03b1) over the conversion range (model-free)."
             sources.append(EaSource(
-                f"{name} mean", float(value),
-                "Mean of Ea(\u03b1) over the conversion range (model-free)."
-                + ("" if recommended else "  No Coats-Redfern model was recommended."),
+                label, float(value),
+                note + ("" if recommended else "  No Coats-Redfern model was recommended."),
+                key=f"{name} mean",
             ))
 
     for name, fit in sorted(cr_results.items(), key=lambda kv: -(kv[1].get("r2") or 0)):

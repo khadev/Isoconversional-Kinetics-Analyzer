@@ -3,6 +3,41 @@
 All notable changes to this project are documented in this file.
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [2.0.0] - 2026-11-15
+
+### Added
+- **Stabilization interval.** On the *Kinetic Plot* tab, click and drag horizontally
+  (matplotlib `SpanSelector`) to select an alpha range. The range is shaded (`axvspan`), every
+  legend entry shows the mean Ea inside it -- `Friedman (mean Ea [0.20-0.80] = 96.49 kJ/mol)` --
+  and the Summary cards show it too. **Reset to Full Range** (button above the plot, or a
+  double-click on the plot) restores the full-range legend. The full-range results are never
+  modified. Edge cases: a drag past the data is clipped to it, a selection entirely outside the
+  data or with fewer than 3 grid points is rejected with a message, and a method with fewer than
+  3 points inside the range shows `N/A`. The selector is re-attached after every redraw, theme
+  change, plot-style change and analysis run.
+- **Lifetime tab synchronisation** (`KineticsApp._sync_lifetime_tab`). The method-mean entries of
+  the *Activation energy source* list switch to the interval means and carry it in their label,
+  e.g. `Friedman mean (alpha 0.20-0.80)`; the same kind of source stays selected, a lifetime that
+  was already calculated is recalculated, and resetting the range reverts to the full-range means.
+- **Export**: `export_all`, `save_data_txt`, `save_summary_txt` and `save_data_xlsx` take
+  `interval: Optional[Tuple[float, float]]`. The `(average)` row of `Ea_data.txt` (and its mean
+  `KTH_A`) and the `Averages` sheet hold the mean **inside the interval** (a `full_range_average`
+  column keeps the full-range value); the files start with
+  `# Selected stabilization interval: alpha 0.20 to 0.80` (also stored in the workbook properties);
+  `Summary.txt` adds an interval table. The Averages sheet then has its header on row 2.
+- **Calculate KTH Full Triplet** button, centered over the *KTH Model* plot; shown only while data
+  is loaded and no triplet exists. It runs `kinetics.kth_full` in a background thread (the window
+  stays responsive), then updates the KTH plot, the Results Table (A and f(alpha) columns), the
+  main plot, the Summary and the Lifetime tab. A stale-result guard drops the result if new data
+  is loaded, an analysis is started or a newer request was made meanwhile.
+- `kinetics.calculate_interval_mean(results, alpha_min, alpha_max, min_points=1)`: the single
+  NaN-safe implementation behind all of the above. New modules `isokinetics.interval` (pure
+  helpers) and `isokinetics.interaction` (mouse controller); `formatting.fmt_interval`.
+- Tests: `test_interval.py`, `test_gui_interval.py`, `test_gui_v2.py`.
+
+### Changed
+- Version 2.0.0.
+
 ## [1.9.0] - 2026-10-12
 
 ### Changed

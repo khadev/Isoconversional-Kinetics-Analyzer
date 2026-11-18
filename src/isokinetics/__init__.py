@@ -12,7 +12,7 @@ This package exposes both:
     ``exporter``) that can be used headlessly / in scripts / notebooks.
 """
 
-__version__ = "1.9.0"
+__version__ = "2.0.0"
 __author__ = "Isoconversional Kinetics Toolkit Contributors"
 __license__ = "MIT"
 

@@ -170,3 +170,24 @@ def fmt_days(value: Optional[float]) -> str:
 def fmt_minutes(value: Optional[float]) -> str:
     """Lifetime in minutes, whole numbers: ``6,488,640``."""
     return fmt_time_value(value, 0)
+
+
+# --- alpha intervals (stabilization phase) ----------------------------------
+def fmt_interval_end(value: Optional[float]) -> str:
+    """One end of an alpha interval: 2 decimals (``0.20``), or 3 when the value
+    genuinely needs them (``0.753``) so the text never misstates the range."""
+    if not _finite(value):
+        return NA
+    v = float(value)
+    text = f"{v:.2f}"
+    if abs(float(text) - v) > 1e-9:
+        text = f"{v:.{ALPHA_DECIMALS}f}"
+    return text
+
+
+def fmt_interval(lo: Optional[float], hi: Optional[float]) -> str:
+    """An alpha range for legends, labels and tables: ``0.20\u20130.80`` (en dash).
+    Non-finite ends give ``N/A``."""
+    if not (_finite(lo) and _finite(hi)):
+        return NA
+    return f"{fmt_interval_end(lo)}\u2013{fmt_interval_end(hi)}"

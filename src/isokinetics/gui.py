@@ -45,8 +45,9 @@ except Exception:  # pragma: no cover - darkdetect is optional at runtime
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from . import __version__ as isokinetics_version
-from . import data_loader, exporter, kinetics, lifetime, plotter, validation
+from . import data_loader, exporter, interval, kinetics, lifetime, plotter, validation
 from ._tk_utils import cancel_all_pending_after_callbacks
+from .interaction import AlphaSpanController
 from .formatting import (
     EMPTY,
     UNIT_EA_PLAIN,
@@ -56,6 +57,7 @@ from .formatting import (
     fmt_days,
     fmt_duration,
     fmt_ea,
+    fmt_interval,
     fmt_minutes,
     fmt_pct,
     fmt_r2,
@@ -332,6 +334,21 @@ class KineticsApp(ctk.CTk):
         self.validation_report: Optional[validation.ValidationReport] = None
         self.lifetime_result: Optional[lifetime.LifetimeResult] = None
         self._lifetime_sources: Dict[str, lifetime.EaSource] = {}
+
+        # "Stabilization phase": alpha range selected on the plot (None = full range).
+        # The full-range results/averages are never modified; these only drive
+        # the legend, the shaded span, the Summary cards and the exports.
+        self.alpha_interval: Optional[interval.AlphaInterval] = None
+        self.interval_means: Dict[str, float] = {}
+        self._interval_token = 0          # newest selection wins (stale worker results are dropped)
+        self._results_version = 0         # bumped whenever self.results is replaced
+        self._ci_cache = None             # ((results_version, betas), ci) -- avoids recomputing on every drag
+
+        # Manual "Calculate KTH Full Triplet": a result is applied only if neither the data nor a
+        # newer click/analysis has superseded it (see _apply_kth_full).
+        self._kth_token = 0
+        self._kth_busy = False
+        self._data_version = 0
 
         # progress bookkeeping (see _begin_stage / _tick)
         self._run_started: Optional[float] = None
@@ -626,10 +643,29 @@ class KineticsApp(ctk.CTk):
         self._populate_summary({}, {})
 
     def _build_plot_tab(self) -> None:
+        bar = ctk.CTkFrame(self.tab_plot, fg_color="transparent")
+        bar.pack(fill="x", padx=4, pady=(2, 0))
+        self.interval_label = ctk.CTkLabel(bar, text="", anchor="w", justify="left",
+                                           text_color=_c("muted"))
+        self.interval_label.pack(side="left", fill="x", expand=True)
+        self.reset_interval_button = ctk.CTkButton(
+            bar, text="Reset to Full Range", width=150, height=26, state="disabled",
+            command=self._on_reset_interval, fg_color=_c("card_alt"), text_color=_c("text"),
+            hover_color=_c("select"), border_width=1, border_color=_c("border"),
+        )
+        self.reset_interval_button.pack(side="right")
+
         self.figure = plotter.build_figure()
         self.canvas = FigureCanvasTkAgg(self.figure, master=self.tab_plot)
         self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=4, pady=4)
         self.canvas.draw()
+
+        # click-and-drag selects an alpha range, double-click resets it
+        self.span_controller = AlphaSpanController(
+            self.canvas, on_select=self._on_alpha_selected, on_reset=self._on_reset_interval,
+            on_move=self._on_alpha_dragging,
+        )
+        self._update_interval_widgets()
 
     def _build_results_tab(self) -> None:
         top = ctk.CTkFrame(self.tab_results, fg_color="transparent")
@@ -654,6 +690,14 @@ class KineticsApp(ctk.CTk):
         self.kth_canvas = FigureCanvasTkAgg(self.kth_figure, master=self.tab_kth)
         self.kth_canvas.get_tk_widget().pack(fill="both", expand=True, padx=4, pady=4)
         self.kth_canvas.draw()
+
+        # Centered over the (empty) plot; shown only while there is data but no triplet yet.
+        self.kth_calc_button = ctk.CTkButton(
+            self.tab_kth, text="Calculate KTH Full Triplet", width=250, height=42,
+            font=ctk.CTkFont(size=14, weight="bold"), fg_color=_c("accent"),
+            hover_color=_c("accent_hover"), command=self._on_calculate_kth_full,
+        )
+        self._update_kth_button()
 
     def _build_model_fitting_tab(self) -> None:
         self.cr_summary_label = ctk.CTkLabel(
@@ -912,12 +956,14 @@ class KineticsApp(ctk.CTk):
 
     def _redraw_all_plots(self) -> None:
         pal = plotter.THEMES[self._theme_name]
-        plotter.update_plot(self.figure, self.results, self.averages, self._current_ci())
+        self._update_main_figure()
         plotter.update_kth_model_plot(self.kth_figure, self.kth_full_result)
         plotter.update_coats_redfern_plot(self.cr_figure, self.cr_result)
         for canvas in (self.canvas, self.kth_canvas, self.cr_canvas):
             canvas.get_tk_widget().configure(bg=pal["figure"], highlightthickness=0)
             canvas.draw()
+        self._arm_span_selector()
+        self._update_interval_widgets()
 
     # ------------------------------------------------------------------ #
     # Display-option handlers
@@ -950,13 +996,135 @@ class KineticsApp(ctk.CTk):
     def _on_plot_style_changed(self, style_name: str) -> None:
         plotter.apply_plot_style(style_name)
         if self.results:
-            plotter.update_plot(self.figure, self.results, self.averages, self._current_ci())
-            self.canvas.draw()
+            self._refresh_main_plot()
 
     def _on_show_ci_toggled(self) -> None:
         if self.results:
-            plotter.update_plot(self.figure, self.results, self.averages, self._current_ci())
-            self.canvas.draw()
+            self._refresh_main_plot()
+
+    # ------------------------------------------------------------------ #
+    # Stabilization phase: select an alpha range on the plot
+    # ------------------------------------------------------------------ #
+    def _ci_for_plot(self):
+        """Confidence bands for the plot, cached so that dragging/resetting an
+        alpha range does not recompute them every time."""
+        if not self.show_ci_var.get():
+            return None
+        try:
+            betas = tuple(self._read_betas())
+        except ValueError:
+            return None
+        key = (self._results_version, betas)
+        if self._ci_cache is None or self._ci_cache[0] != key:
+            self._ci_cache = (key, self._current_ci())
+        return self._ci_cache[1]
+
+    def _update_main_figure(self) -> None:
+        """Redraw the Ea(alpha) figure (not the canvas) for the current
+        results and -- if one is selected -- the stabilization interval."""
+        plotter.update_plot(
+            self.figure, self.results, self.averages, self._ci_for_plot(),
+            interval=self.alpha_interval, interval_means=self.interval_means or None,
+        )
+
+    def _arm_span_selector(self) -> None:
+        """(Re)create the drag selector; needed after every redraw because
+        ``fig.clear()`` destroys the previous selector's artists."""
+        try:
+            self.span_controller.enabled = bool(self.results) and not self.is_running
+            self.span_controller.attach()
+        except Exception:  # noqa: BLE001 - a selector problem must never break a redraw
+            logger.exception("Could not re-attach the alpha-range selector")
+
+    def _refresh_main_plot(self) -> None:
+        """Redraw the main plot with the current interval, then re-arm the selector."""
+        self._update_main_figure()
+        self.canvas.draw()
+        self._arm_span_selector()
+        self._update_interval_widgets()
+
+    def _update_interval_widgets(self) -> None:
+        iv = self.alpha_interval
+        if iv is None:
+            self.interval_label.configure(
+                text=("Drag on the plot to select an \u03b1 range (stabilization phase) \u00b7 "
+                      "double-click to reset" if self.results
+                      else "Run an analysis, then drag on the plot to select an \u03b1 range."),
+                text_color=_c("muted"))
+            self.reset_interval_button.configure(state="disabled")
+        else:
+            self.interval_label.configure(
+                text=f"Stabilization phase \u03b1 = {iv.label}  \u00b7  mean E\u2090 shown for this range only",
+                text_color=_c("accent"))
+            self.reset_interval_button.configure(state="normal")
+
+    def _on_alpha_dragging(self, vmin: float, vmax: float) -> None:
+        """Mouse moved with the button down: cheap live feedback only."""
+        self._set_status(f"Selecting \u03b1 {fmt_interval(min(vmin, vmax), max(vmin, vmax))} \u2026 "
+                         "release to apply, double-click to reset")
+
+    def _on_alpha_selected(self, vmin: float, vmax: float) -> None:
+        """Mouse released after a drag (``on_select``).  Validates the range,
+        then computes the interval means in a worker thread and applies them
+        back on the Tk thread (see :meth:`_apply_interval`)."""
+        if not self.results or self.working_df is None:
+            return
+        alphas = self.working_df["alpha"]
+        iv = interval.clip_interval(vmin, vmax, float(alphas.min()), float(alphas.max()))
+        if iv is None:
+            self._reject_selection(
+                f"The selection lies outside the data (\u03b1 {fmt_interval(alphas.min(), alphas.max())}).")
+            return
+        n = interval.max_point_count(self.results, iv)
+        if n < interval.MIN_POINTS:
+            self._reject_selection(
+                f"\u03b1 {iv.label} contains only {n} grid point(s); at least "
+                f"{interval.MIN_POINTS} are needed for a mean. Drag a wider range.")
+            return
+
+        self._interval_token += 1
+        token = self._interval_token
+        snapshot = {name: dict(res) for name, res in self.results.items()}  # thread-safe copy
+        threading.Thread(target=self._interval_worker, args=(token, iv, snapshot), daemon=True).start()
+
+    def _interval_worker(self, token: int, iv, snapshot) -> None:
+        """Background thread: pure arithmetic only, no Tk access."""
+        means = interval.interval_means(snapshot, iv)
+        self._post(self._apply_interval, token, iv, means)
+
+    def _apply_interval(self, token: int, iv, means: Dict[str, float]) -> None:
+        """Tk thread: adopt the interval, unless a newer selection/reset has
+        happened since this one was started (stale results are dropped)."""
+        if not self._alive or token != self._interval_token or not self.results:
+            return
+        self.alpha_interval = iv
+        self.interval_means = means
+        self._refresh_main_plot()
+        self._populate_summary(self.results, self.averages)
+        self._sync_lifetime_tab()
+        shown = ",  ".join(f"{name} {fmt_ea(value)}" for name, value in means.items())
+        self._set_status(f"Mean E\u2090 over \u03b1 {iv.label} ({UNIT_EA_PLAIN}):  {shown}")
+
+    def _reject_selection(self, message: str) -> None:
+        """Invalid selection: keep the previous state, say why, and redraw so
+        the selector's half-drawn rectangle disappears."""
+        self._set_status(message)
+        self._refresh_main_plot()
+
+    def _on_reset_interval(self) -> None:
+        """Reset to Full Range (button or double-click): drop the selection,
+        the shaded span and the interval legend; the full-range numbers
+        were never touched."""
+        self._interval_token += 1           # also cancels a selection still being computed
+        self.alpha_interval = None
+        self.interval_means = {}
+        if self.results:
+            self._refresh_main_plot()
+            self._populate_summary(self.results, self.averages)
+            self._sync_lifetime_tab()
+            self._set_status("Showing the full \u03b1 range.")
+        else:
+            self._update_interval_widgets()
 
     def _current_ci(self) -> Optional[Dict[str, Dict[float, "tuple[float, float, float]"]]]:
         """Recompute confidence intervals for whichever supported
@@ -1100,6 +1268,11 @@ class KineticsApp(ctk.CTk):
         self._set_status(status)
 
         # Reset previous results whenever new data is loaded.
+        self._data_version += 1
+        self._invalidate_kth()
+        self._interval_token += 1
+        self.alpha_interval, self.interval_means = None, {}
+        self._results_version += 1
         self.results = {}
         self.averages = {}
         self.kth_full_result = None
@@ -1112,6 +1285,7 @@ class KineticsApp(ctk.CTk):
         self._clear_lifetime_result()
         self._refresh_lifetime_sources()
         self._reset_progress()
+        self._update_kth_button()          # data loaded, no triplet yet -> offer the button
         self._select_tab(TAB_PREVIEW)
 
     def _update_raw_controls(self) -> None:
@@ -1185,6 +1359,7 @@ class KineticsApp(ctk.CTk):
 
         kth_mode = self.kth_mode_var.get()
 
+        self._invalidate_kth()               # a triplet still being computed is now stale
         self._stop_event.clear()
         thread = threading.Thread(
             target=self._run_analysis_worker,
@@ -1353,8 +1528,13 @@ class KineticsApp(ctk.CTk):
         self.kth_full_result = kth_full_result
         self.cr_result = cr_result
 
-        plotter.update_plot(self.figure, results, averages, self._current_ci())
-        self.canvas.draw()
+        self._results_version += 1
+        if self.alpha_interval is not None:   # keep the selected range, recompute its means
+            if interval.max_point_count(results, self.alpha_interval) >= interval.MIN_POINTS:
+                self.interval_means = interval.interval_means(results, self.alpha_interval)
+            else:
+                self.alpha_interval, self.interval_means = None, {}
+        self._refresh_main_plot()
         plotter.update_kth_model_plot(self.kth_figure, kth_full_result)
         self.kth_canvas.draw()
         self._populate_model_fitting_tab(cr_result)
@@ -1404,12 +1584,12 @@ class KineticsApp(ctk.CTk):
     def _populate_results_table(self, results: Dict[str, Dict[float, float]]) -> None:
         self._clear_results_table()
 
-        all_alphas = sorted(
-            {a for method_results in results.values() for a in method_results.keys()}
-        )
-
         kth_A = self.kth_full_result["A"] if self.kth_full_result else {}
         kth_f = self.kth_full_result["f_alpha"] if self.kth_full_result else {}
+
+        all_alphas = sorted(
+            {a for method_results in results.values() for a in method_results.keys()} | set(kth_A)
+        )
 
         for i, a in enumerate(all_alphas):
             row = [fmt_alpha(a)]
@@ -1591,8 +1771,14 @@ class KineticsApp(ctk.CTk):
             ctk.CTkLabel(card, text=fmt_ea(st["mean"]), font=self.font_big,
                          text_color=_c("text")).pack(anchor="w", padx=14)
             self._muted(card, f"{UNIT_EA_PLAIN}  \u00b7  \u00b1 {fmt_ea(st['std'])}  (std over \u03b1)").pack(anchor="w", padx=14)
+            sub = self.interval_means.get(name) if self.alpha_interval is not None else None
             self._muted(card, f"range {fmt_ea(st['min'])} \u2013 {fmt_ea(st['max'])}").pack(
-                anchor="w", padx=14, pady=(0, 10))
+                anchor="w", padx=14, pady=(0, 10 if self.alpha_interval is None else 2))
+            if self.alpha_interval is not None:
+                text = (f"mean [{self.alpha_interval.label}] = {fmt_ea(sub)}" if sub is not None and sub == sub
+                        else f"[{self.alpha_interval.label}]: N/A (< {interval.MIN_POINTS} points)")
+                ctk.CTkLabel(card, text=text, font=self.font_h, text_color=_c("accent")).pack(
+                    anchor="w", padx=14, pady=(0, 10))
 
         notes = self._insights(results, averages)
         if notes:
@@ -1607,17 +1793,140 @@ class KineticsApp(ctk.CTk):
                     anchor="w", padx=14, pady=(0, 6))
 
     # ------------------------------------------------------------------ #
+    # Manual KTH full triplet (button on the KTH Model tab)
+    # ------------------------------------------------------------------ #
+    @property
+    def kth_button_visible(self) -> bool:
+        """True while the 'Calculate KTH Full Triplet' button is shown."""
+        return self.kth_calc_button.winfo_manager() == "place"
+
+    def _update_kth_button(self) -> None:
+        """Show the button only when data is loaded, no triplet exists yet, and nothing
+        is running (an analysis or a triplet calculation)."""
+        show = (
+            self.working_df is not None
+            and self.kth_full_result is None
+            and not self._kth_busy
+            and not self.is_running
+        )
+        if show:
+            self.kth_calc_button.place(relx=0.5, rely=0.5, anchor="center")
+            self.kth_calc_button.lift()
+        else:
+            self.kth_calc_button.place_forget()
+
+    def _invalidate_kth(self) -> None:
+        """Make any triplet calculation still in flight stale (new data, new analysis,
+        newer click): its result will be dropped when it arrives."""
+        self._kth_token += 1
+        self._kth_busy = False
+
+    def _on_calculate_kth_full(self) -> None:
+        """Button handler: hide the button and run kinetics.kth_full in a worker thread."""
+        if self.working_df is None or self.kth_full_result is not None or self._kth_busy:
+            return
+        try:
+            betas = self._read_betas()
+        except ValueError as exc:
+            messagebox.showerror("Invalid heating rates", str(exc))
+            return
+        self._kth_busy = True
+        self._kth_token += 1
+        token, version = self._kth_token, self._data_version
+        self._update_kth_button()                       # hides the button
+        self._set_status("Calculating KTH full triplet\u2026")
+        df = self.working_df.copy()                     # the worker never touches shared state
+        threading.Thread(target=self._kth_worker, args=(token, version, df, betas), daemon=True).start()
+
+    def _kth_worker(self, token: int, version: int, df, betas) -> None:
+        """Background thread: computation only, no Tk access."""
+        try:
+            full = kinetics.kth_full(df, betas)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("KTH full triplet failed")
+            self._post(self._on_kth_failed, token, version, str(exc))
+            return
+        self._post(self._apply_kth_full, token, version, full)
+
+    def _kth_result_is_stale(self, token: int, version: int) -> bool:
+        return (not self._alive) or token != self._kth_token or version != self._data_version
+
+    def _apply_kth_full(self, token: int, version: int, full: Dict[str, object]) -> None:
+        """Tk thread: adopt the triplet unless it is stale, then refresh every view that shows it."""
+        if self._kth_result_is_stale(token, version):
+            return
+        self._kth_busy = False
+        self.kth_full_result = full
+        ea = full["Ea"]
+        if "KTH" not in self.results:       # KTH was not part of the analysis: add it now
+            self.results = dict(self.results)
+            self.results["KTH"] = ea
+            self.averages = dict(self.averages)
+            self.averages["KTH"] = kinetics.average_ea(ea)
+            self._results_version += 1
+            if self.alpha_interval is not None:
+                self.interval_means = interval.interval_means(self.results, self.alpha_interval)
+
+        plotter.update_kth_model_plot(self.kth_figure, full)
+        self.kth_canvas.draw()
+        self._populate_results_table(self.results)      # now with the A and f(alpha) columns
+        self._refresh_main_plot()
+        self._populate_summary(self.results, self.averages)
+        self._sync_lifetime_tab()
+        self.export_button.configure(state="normal")
+        self._update_kth_button()
+        model = full.get("model")
+        self._set_status("KTH full triplet calculated" + (f" (model: {model})." if model else "."))
+
+    def _on_kth_failed(self, token: int, version: int, message: str) -> None:
+        if self._kth_result_is_stale(token, version):
+            return
+        self._kth_busy = False
+        self._update_kth_button()                       # offer the button again
+        self._set_status("KTH full triplet failed.")
+        messagebox.showwarning("KTH full triplet", f"The KTH full triplet could not be computed:\n{message}")
+
+    # ------------------------------------------------------------------ #
     # Lifetime tab
     # ------------------------------------------------------------------ #
     def _refresh_lifetime_sources(self) -> None:
-        """Rebuild the Ea-source menu from the current analysis results;
-        the recommended Coats-Redfern model (if any) is selected first."""
-        sources = lifetime.available_ea_sources(self.averages, self.cr_result)
-        self._lifetime_sources = {src.label: src for src in sources}
-        labels = list(self._lifetime_sources)
-        self.lifetime_source_menu.configure(values=labels)
-        self.lifetime_source_var.set(labels[0])
-        self._update_lifetime_ea_display()
+        """Rebuild the Ea-source menu from the current analysis results and select the first
+        entry (the recommended Coats-Redfern model, if any)."""
+        self._sync_lifetime_tab(keep_selection=False)
+
+    def _sync_lifetime_tab(self, keep_selection: bool = True) -> None:
+        """
+        Bring the Lifetime tab in line with the current results and stabilization interval.
+
+        * With an interval selected, the method-mean entries use the **interval** means and
+          their labels carry the interval, e.g. ``Friedman mean (\u03b1 0.20\u20130.80)``.
+          Without one they are the full-range means (this is also the "reset" path).
+        * ``keep_selection=True`` keeps the same *kind* of source selected (matched by
+          ``EaSource.key``, so "Friedman mean" stays selected when its label gains the suffix);
+          otherwise the first entry is selected.
+        * If a lifetime was already calculated it is recalculated with the new Ea.
+
+        Never raises: a problem here must not break plotting or analysis.
+        """
+        try:
+            previous = self._selected_lifetime_source() if keep_selection else None
+            if self.alpha_interval is not None:
+                sources = lifetime.available_ea_sources(
+                    self.interval_means, self.cr_result, interval_label=self.alpha_interval.label)
+            else:
+                sources = lifetime.available_ea_sources(self.averages, self.cr_result)
+            self._lifetime_sources = {src.label: src for src in sources}
+            labels = list(self._lifetime_sources)
+            chosen = labels[0]
+            if previous is not None:
+                chosen = next((src.label for src in sources if src.key == previous.key), labels[0])
+            self.lifetime_source_menu.configure(values=labels)
+            self.lifetime_source_var.set(chosen)
+            self._update_lifetime_ea_display()
+            if self.lifetime_result is not None:
+                self._on_calculate_lifetime()
+        except Exception:  # noqa: BLE001
+            logger.exception("Could not synchronise the Lifetime tab")
 
     def _selected_lifetime_source(self) -> lifetime.EaSource:
         label = self.lifetime_source_var.get()
@@ -1706,7 +2015,8 @@ class KineticsApp(ctk.CTk):
         high_y = result.lifetime_days_high_ea / lifetime.DAYS_PER_YEAR
         unc = f"{result.ea_uncertainty_pct:g}"
         self.lifetime_detail_label.configure(
-            text=f"Using E\u2090 = {fmt_ea(result.ea_kj, unit=True)}  \u00b7  acceleration factor = {af_text}\n"
+            text=f"Using E\u2090 = {fmt_ea(result.ea_kj, unit=True)} ({self._selected_lifetime_source().label})  \u00b7  "
+                 f"acceleration factor = {af_text}\n"
                  f"Sensitivity: E\u2090 \u2212{unc} % \u2192 {fmt_years(low_y)} years;  "
                  f"E\u2090 +{unc} % \u2192 {fmt_years(high_y)} years"
         )
@@ -1800,6 +2110,8 @@ class KineticsApp(ctk.CTk):
             "Methods": ", ".join(self.results.keys()),
             "Date": datetime.date.today().isoformat(),
         }
+        if self.alpha_interval is not None:
+            metadata["Stabilization phase"] = f"alpha = {self.alpha_interval.label} (selected on the plot)"
 
         try:
             out_path = exporter.export_all(
@@ -1811,6 +2123,7 @@ class KineticsApp(ctk.CTk):
                 metadata=metadata,
                 cr_result=self.cr_result,
                 cr_figure=self.cr_figure,
+                interval=(self.alpha_interval.lo, self.alpha_interval.hi) if self.alpha_interval else None,
             )
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Export error", str(exc))
@@ -1965,6 +2278,11 @@ class KineticsApp(ctk.CTk):
                 except Exception:  # noqa: BLE001 - best-effort during teardown
                     pass
 
+        try:
+            self.span_controller.close()
+        except Exception:  # noqa: BLE001 - best-effort during teardown
+            pass
+
         cancel_all_pending_after_callbacks(self)
 
         try:
@@ -2006,6 +2324,10 @@ class KineticsApp(ctk.CTk):
         self.save_processed_button.configure(state=state)
         for entry in self.beta_entries:
             entry.configure(state=state)
+        # no selecting on stale results while an analysis is running
+        self.span_controller.enabled = (not running) and bool(self.results)
+        self.span_controller.attach()
+        self._update_kth_button()
 
     def _set_status(self, message: str) -> None:
         self.status_label.configure(text=message)

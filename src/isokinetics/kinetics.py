@@ -1246,6 +1246,62 @@ def average_ea(results: Dict[float, float]) -> float:
     return float(np.mean(finite))
 
 
+def calculate_interval_mean(
+    results: Dict[float, float],
+    alpha_min: float,
+    alpha_max: float,
+    min_points: int = 1,
+) -> float:
+    """
+    Mean activation energy of one method over the conversion range
+    ``alpha_min <= alpha <= alpha_max`` (both ends inclusive).
+
+    This is the single implementation behind the "stabilization interval"
+    feature: the plot legend, the Summary cards, the Lifetime tab and the
+    exports all call it, so they can never disagree.  The full-range
+    :func:`average_ea` and the ``results`` dictionary are left untouched.
+
+    Parameters
+    ----------
+    results : dict
+        Mapping alpha -> Ea (kJ/mol) for one method.
+    alpha_min, alpha_max : float
+        Interval ends.  Given in either order (a right-to-left selection
+        is accepted); an end outside the data simply selects what exists.
+    min_points : int, optional
+        Fewest finite points required (default 1).  The GUI passes 3 so a
+        "mean" is never reported from one or two grid points.
+
+    Returns
+    -------
+    float
+        Mean Ea in kJ/mol over the finite values inside the interval, or
+        ``nan`` if there are fewer than ``min_points`` of them, if a bound
+        is not finite, or if ``results`` is empty.  NaN / ``None`` Ea
+        values are ignored.
+    """
+    try:
+        lo, hi = float(alpha_min), float(alpha_max)
+    except (TypeError, ValueError):
+        return float("nan")
+    if not (np.isfinite(lo) and np.isfinite(hi)) or not results:
+        return float("nan")
+    if lo > hi:
+        lo, hi = hi, lo
+    eps = 1e-9  # grid values such as 0.30000000000000004 must still match an end of 0.3
+    values = []
+    for alpha, ea in results.items():
+        try:
+            a, e = float(alpha), float(ea)
+        except (TypeError, ValueError):
+            continue
+        if lo - eps <= a <= hi + eps and np.isfinite(e):
+            values.append(e)
+    if len(values) < max(1, int(min_points)):
+        return float("nan")
+    return float(np.mean(values))
+
+
 # --------------------------------------------------------------------------- #
 # 7. Coats-Redfern (model-fitting integral method) + model ranking
 # --------------------------------------------------------------------------- #

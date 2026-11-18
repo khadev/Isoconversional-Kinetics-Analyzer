@@ -26,12 +26,13 @@ from __future__ import annotations
 import datetime as _dt
 import logging
 import os
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 from matplotlib.figure import Figure
 
 from . import plotter
+from .interval import MIN_POINTS, AlphaInterval, interval_statistics
 from .formatting import (
     EXPORT_ALPHA_DECIMALS,
     EXPORT_EA_DECIMALS,
@@ -39,10 +40,46 @@ from .formatting import (
     EXPORT_SCORE_DECIMALS,
     fmt_ea,
     fmt_fixed,
+    fmt_interval_end,
     fmt_sci,
 )
 
 logger = logging.getLogger(__name__)
+
+#: The stabilization interval as accepted by the exporters: ``(alpha_min, alpha_max)``.
+IntervalLike = Optional[Tuple[float, float]]
+
+
+def _normalise_interval(interval) -> Optional[Tuple[float, float]]:
+    """``(lo, hi)`` with ``lo <= hi`` from a tuple/list or an
+    :class:`~isokinetics.interval.AlphaInterval`; ``None`` if absent or not finite."""
+    if interval is None:
+        return None
+    try:
+        lo, hi = (interval.lo, interval.hi) if hasattr(interval, "lo") else interval
+        lo, hi = float(lo), float(hi)
+    except (TypeError, ValueError):
+        return None
+    if not (np.isfinite(lo) and np.isfinite(hi)):
+        return None
+    return (lo, hi) if lo <= hi else (hi, lo)
+
+
+def interval_comment(interval: IntervalLike) -> str:
+    """The comment line written at the top of exported files::
+
+        # Selected stabilization interval: alpha 0.20 to 0.80
+    """
+    lo, hi = _normalise_interval(interval)  # type: ignore[misc]
+    return f"# Selected stabilization interval: alpha {fmt_interval_end(lo)} to {fmt_interval_end(hi)}"
+
+
+def interval_averages(
+    results: Dict[str, Dict[float, float]], interval: Tuple[float, float]
+) -> Dict[str, float]:
+    """Mean Ea of every method inside ``interval`` (NaN if fewer than 3 points)."""
+    lo, hi = interval
+    return {n: calculate_interval_mean(r, lo, hi, min_points=MIN_POINTS) for n, r in results.items()}
 
 
 def _xlsxwriter_available() -> bool:
@@ -61,7 +98,7 @@ def _xlsxwriter_available() -> bool:
 #: it just skips that one file with a logged warning.
 EXCEL_EXPORT_AVAILABLE = _xlsxwriter_available()
 
-from .kinetics import average_ea
+from .kinetics import average_ea, calculate_interval_mean
 
 
 def make_output_folder(base_dir: str) -> str:
@@ -162,6 +199,7 @@ def save_data_txt(
     filename: str = "Ea_data.txt",
     averages: Optional[Dict[str, float]] = None,
     kth_full_result: Optional[Dict[str, object]] = None,
+    interval: IntervalLike = None,
 ) -> str:
     """
     Write a tab-delimited text file with the Ea(alpha) results for every
@@ -197,6 +235,14 @@ def save_data_txt(
         The dict returned by :func:`isokinetics.kinetics.kth_full`, if
         KTH was run in "Full triplet" mode. Adds ``KTH_A`` and
         ``KTH_f_alpha`` columns when present.
+    interval : (float, float), optional
+        Selected stabilization interval ``(alpha_min, alpha_max)``.  When
+        given, the file starts with the comment line
+        ``# Selected stabilization interval: alpha 0.20 to 0.80`` and the
+        ``(average)`` row (including the mean ``KTH_A``) is computed **only
+        over that interval** (``NaN`` for a method with fewer than 3 points
+        inside it; ``averages`` is then ignored for that row).  The data rows
+        always list the full alpha range.
 
     Returns
     -------
@@ -204,7 +250,10 @@ def save_data_txt(
         Full path to the written file.
     """
     method_names = list(results.keys())
-    if averages is None:
+    rng = _normalise_interval(interval)
+    if rng is not None:
+        averages = interval_averages(results, rng)   # (average) row = interval mean
+    elif averages is None:
         averages = {name: average_ea(results[name]) for name in method_names}
 
     # Union of every alpha value seen across all methods, sorted ascending.
@@ -218,6 +267,8 @@ def save_data_txt(
 
     path = os.path.join(out_folder, filename)
     with open(path, "w", encoding="utf-8") as fh:
+        if rng is not None:
+            fh.write(interval_comment(rng) + "\n")
         if kth_full_result is not None:
             fh.write(f"# KTH identified reaction model: {kth_full_result.get('model', 'unknown')}\n")
 
@@ -229,11 +280,15 @@ def save_data_txt(
             for name in method_names
         ]
         if kth_full_result is not None:
-            finite_A = [v for v in kth_A.values() if v == v]
-            avg_A = (
-                fmt_sci(sum(finite_A) / len(finite_A), EXPORT_SCI_DECIMALS, na="NaN")
-                if finite_A else "NaN"
-            )
+            if rng is not None:
+                mean_A = calculate_interval_mean(kth_A, rng[0], rng[1], min_points=MIN_POINTS)
+                avg_A = fmt_sci(mean_A, EXPORT_SCI_DECIMALS, na="NaN")
+            else:
+                finite_A = [v for v in kth_A.values() if v == v]
+                avg_A = (
+                    fmt_sci(sum(finite_A) / len(finite_A), EXPORT_SCI_DECIMALS, na="NaN")
+                    if finite_A else "NaN"
+                )
             avg_row += [avg_A, "-"]
         fh.write("\t".join(avg_row) + "\n")
 
@@ -275,12 +330,22 @@ def save_summary_txt(
     metadata: Optional[Dict[str, str]] = None,
     cr_result: Optional[Dict[str, object]] = None,
     kth_full_result: Optional[Dict[str, object]] = None,
+    interval: IntervalLike = None,
 ) -> str:
     """Write a short human-readable summary of the run (metadata, per-method
-    mean/std/range of Ea, KTH model, Coats-Redfern recommendation)."""
+    mean/std/range of Ea, KTH model, Coats-Redfern recommendation).
+
+    If ``interval`` ``(alpha_min, alpha_max)`` -- the stabilization interval
+    selected on the plot -- is given, the file starts with the comment line
+    ``# Selected stabilization interval: alpha 0.20 to 0.80`` and a table with
+    the statistics **inside that alpha range** follows the full-range table
+    (the full-range table is always kept for reference)."""
     stats = method_statistics(results)
+    rng = _normalise_interval(interval)
     path = os.path.join(out_folder, filename)
     with open(path, "w", encoding="utf-8") as fh:
+        if rng is not None:
+            fh.write(interval_comment(rng) + "\n")
         fh.write("Isoconversional kinetics - run summary\n")
         fh.write("=" * 40 + "\n")
         for k, v in (metadata or {}).items():
@@ -292,6 +357,18 @@ def save_summary_txt(
                 f"{name:<12}{fmt_ea(st['mean']):>10}{fmt_ea(st['std']):>10}"
                 f"{fmt_ea(st['min']):>10}{fmt_ea(st['max']):>10}{st['n']:>6d}\n"
             )
+        if rng is not None:
+            sub = interval_statistics(results, AlphaInterval(*rng))
+            fh.write(
+                f"\nSelected stabilization interval: alpha {fmt_interval_end(rng[0])} to "
+                f"{fmt_interval_end(rng[1])} (Ea in kJ/mol; a mean needs at least {MIN_POINTS} grid points)\n"
+            )
+            fh.write(f"{'Method':<12}{'Mean':>10}{'Std':>10}{'Min':>10}{'Max':>10}{'N':>6}\n")
+            for name, st in sub.items():
+                fh.write(
+                    f"{name:<12}{fmt_ea(st['mean']):>10}{fmt_ea(st['std']):>10}"
+                    f"{fmt_ea(st['min']):>10}{fmt_ea(st['max']):>10}{int(st['n']):>6d}\n"
+                )
         if kth_full_result is not None:
             fh.write(f"\nKTH identified reaction model: {kth_full_result.get('model', 'unknown')}\n")
         if cr_result:
@@ -324,6 +401,7 @@ def save_data_xlsx(
     averages: Optional[Dict[str, float]] = None,
     kth_full_result: Optional[Dict[str, object]] = None,
     cr_result: Optional[Dict[str, object]] = None,
+    interval: IntervalLike = None,
 ) -> str:
     """
     Write an Excel workbook with two sheets: "Ea_vs_alpha" (full table)
@@ -393,10 +471,24 @@ def save_data_xlsx(
     df_avg = pd.DataFrame(
         {"method": method_names, "average_Ea_kJ_per_mol": [averages[n] for n in method_names]}
     )
+    rng = _normalise_interval(interval)
+    if rng is not None:
+        # The Averages sheet describes the selected interval only: the main column becomes the
+        # interval mean (the full-range mean is kept in its own column for reference).
+        sub = interval_statistics({n: results[n] for n in method_names}, AlphaInterval(*rng))
+        df_avg = pd.DataFrame({
+            "method": method_names,
+            "average_Ea_kJ_per_mol": [sub[n]["mean"] for n in method_names],
+            "n_points_in_interval": [int(sub[n]["n"]) for n in method_names],
+            "std_Ea_in_interval_kJ_per_mol": [sub[n]["std"] for n in method_names],
+            "full_range_average_Ea_kJ_per_mol": [averages[n] for n in method_names],
+        })
 
     path = os.path.join(out_folder, filename)
     with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
         book = writer.book
+        if rng is not None:
+            book.set_properties({"comments": interval_comment(rng).lstrip("# ")})
         fmt_a = book.add_format({"num_format": "0.000"})
         fmt_ea_x = book.add_format({"num_format": "0.00"})
         fmt_sci_x = book.add_format({"num_format": "0.000E+00"})
@@ -416,9 +508,17 @@ def save_data_xlsx(
             ws.write(0, col_idx, col, fmt_head)
         ws.freeze_panes(1, 1)
 
-        df_avg.to_excel(writer, sheet_name="Averages", index=False)
-        writer.sheets["Averages"].set_column(0, 0, 14)
-        writer.sheets["Averages"].set_column(1, 1, 22, fmt_ea_x)
+        # With an interval the sheet opens with the comment line, so the table
+        # header sits on row 2 (read it with ``header=1``).
+        df_avg.to_excel(writer, sheet_name="Averages", index=False, startrow=1 if rng else 0)
+        ws_avg = writer.sheets["Averages"]
+        if rng is not None:
+            ws_avg.write(0, 0, interval_comment(rng), book.add_format({"bold": True, "font_color": "#1D4ED8"}))
+        ws_avg.set_column(0, 0, 14)
+        ws_avg.set_column(1, 1, 22, fmt_ea_x)
+        if rng is not None:
+            ws_avg.set_column(2, 2, 22)
+            ws_avg.set_column(3, 4, 32, fmt_ea_x)
 
         if cr_result and cr_result.get("results"):
             df_cr = pd.DataFrame(_cr_rows(cr_result))
@@ -490,6 +590,7 @@ def export_all(
     metadata: Optional[Dict[str, str]] = None,
     cr_result: Optional[Dict[str, object]] = None,
     cr_figure: Optional[Figure] = None,
+    interval: IntervalLike = None,
 ) -> str:
     """
     Convenience wrapper that creates the timestamped output folder and
@@ -533,6 +634,14 @@ def export_all(
     cr_figure : matplotlib.figure.Figure, optional
         The Coats-Redfern R^2 chart, saved as ``Coats_Redfern_plot.*``
         when ``cr_result`` is also given.
+    interval : (float, float), optional
+        The stabilization interval ``(alpha_min, alpha_max)`` selected on the
+        plot.  The ``(average)`` row of ``Ea_data.txt`` and the ``Averages``
+        sheet of the workbook then hold the mean Ea **inside that interval**,
+        every text file starts with ``# Selected stabilization interval: ...``
+        and ``Summary.txt`` adds the interval statistics.  (The saved figure
+        already shows the shaded span and the interval legend if ``fig`` was
+        drawn with it.)
 
     Returns
     -------
@@ -558,16 +667,18 @@ def export_all(
             include_tiff=include_tiff, metadata=metadata,
         )
 
-    save_data_txt(results, out_folder, averages=averages, kth_full_result=kth_full_result)
+    interval = _normalise_interval(interval)
+    save_data_txt(results, out_folder, averages=averages, kth_full_result=kth_full_result,
+                  interval=interval)
     save_summary_txt(
         results, out_folder, metadata=metadata, cr_result=cr_result,
-        kth_full_result=kth_full_result,
+        kth_full_result=kth_full_result, interval=interval,
     )
     if include_excel:
         try:
             save_data_xlsx(
                 results, out_folder, averages=averages,
-                kth_full_result=kth_full_result, cr_result=cr_result,
+                kth_full_result=kth_full_result, cr_result=cr_result, interval=interval,
             )
         except ImportError as exc:
             # A missing optional dependency (xlsxwriter) must never
