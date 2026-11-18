@@ -1,0 +1,14 @@
+# requirements-dev.txt
+# =====================
+# Additional dependencies needed for development, testing, linting,
+# and packaging. Install alongside requirements.txt:
+#
+#     pip install -r requirements.txt -r requirements-dev.txt
+
+pytest==7.4.4
+pytest-cov==4.1.0
+build==1.2.1
+twine==5.1.1
+
+# --- Optional: compiling to a standalone .exe / .app ---
+# pyinstaller==6.10.0
