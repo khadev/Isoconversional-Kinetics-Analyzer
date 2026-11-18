@@ -1,8 +1,14 @@
 # Isoconversional Kinetics Analyzer
-
-[![CI](https://github.com/your-org/isoconversional-kinetics/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/isoconversional-kinetics/actions/workflows/ci.yml)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](pyproject.toml)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)]()
+[![NumPy](https://img.shields.io/badge/powered%20by-NumPy-013243.svg?logo=numpy&logoColor=white)](https://numpy.org/)
+[![pandas](https://img.shields.io/badge/pandas-2.2.3-150458.svg?logo=pandas&logoColor=white)](https://pandas.pydata.org/)
+[![Matplotlib](https://img.shields.io/badge/Matplotlib-3.9.2-11557c.svg)](https://matplotlib.org/)
+[![customtkinter](https://img.shields.io/badge/GUI-customtkinter-1f6feb.svg)](https://github.com/TomSchimansky/CustomTkinter)
+[![GitHub](https://img.shields.io/badge/GitHub-khadev-181717.svg?logo=github&logoColor=white)](https://github.com/khadev)
+[![Release](https://img.shields.io/badge/release-v2.1.0-success.svg)](CHANGELOG.md)
+[![Status](https://img.shields.io/badge/status-production%20ready-brightgreen.svg)]()
 
 A desktop application **and** Python library for **isoconversional kinetic
 analysis** of non-isothermal thermal-decomposition data (TGA/DSC), computing
